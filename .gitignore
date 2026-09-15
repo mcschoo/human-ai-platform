@@ -1,0 +1,16 @@
+.env
+*.local
+.venv/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Local model and Hugging Face caches
+.cache/
+/models/
+
+# Runtime output
+logs/
+*.log
+benchmark-results*.json

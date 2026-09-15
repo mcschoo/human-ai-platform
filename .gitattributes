@@ -1,0 +1,7 @@
+* text=auto
+*.env text eol=lf
+*.example text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+Caddyfile text eol=lf

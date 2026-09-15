@@ -1,0 +1,24 @@
+{
+	admin off
+}
+
+{$CADDY_SITE_ADDRESS} {
+	@openai path /v1 /v1/*
+	handle @openai {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy vllm:8000
+	}
+
+	respond 404
+}
+
+:2019 {
+	@admin path /health /metrics
+	handle @admin {
+		reverse_proxy vllm:8000
+	}
+
+	respond 404
+}

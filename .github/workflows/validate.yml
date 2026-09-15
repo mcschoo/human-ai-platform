@@ -1,0 +1,58 @@
+name: Validate repository
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  docs-and-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint Markdown
+        uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: |
+            README.md
+            benchmarks/**/*.md
+            config/**/*.md
+            docs/**/*.md
+            examples/**/*.md
+
+      - name: Validate Python
+        run: |
+          python -m pip install -e ".[test]"
+          python -m compileall -q benchmarks examples scripts tests
+          python -m pytest -q
+          python -m ruff check .
+          python -m ruff format --check .
+
+      - name: Parse repository YAML
+        shell: ruby {0}
+        run: |
+          require "yaml"
+          paths = Dir[".github/**/*.{yml,yaml}"]
+          paths.each { |path| YAML.load_file(path, aliases: true) }
+          puts "Validated #{paths.length} YAML file(s)"
+
+      - name: Validate model profiles
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          for profile in qwen3.5-9b-bf16 qwen3.5-27b-gptq-int4; do
+            MODEL_PROFILE="$profile" docker compose config --quiet
+          done
+          TLS_DOMAIN=llm.example.edu \
+            docker compose -f compose.yaml -f compose.tls.yaml config --quiet
