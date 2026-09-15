@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Lint Markdown
-        uses: DavidAnson/markdownlint-cli2-action@v19
+        uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: |
             README.md
