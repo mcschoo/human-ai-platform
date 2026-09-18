@@ -23,6 +23,10 @@ CONTROL_PLANE_DB=/tmp/control-plane.db uvicorn control_plane.main:app --port 809
 
 ## Contract
 
+See the root [application integration guide](../../docs/application-integration.md)
+for the minimum adapter lifecycle, complete request examples, callback actions,
+and a deployment checklist.
+
 All application routes use `Authorization: Bearer APP_TOKEN`. Operators create
 an app with `POST /v1/apps` and the `X-Operator-Password` header. An app then
 registers sessions and sends unique events:

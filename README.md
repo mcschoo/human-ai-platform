@@ -100,7 +100,9 @@ CONTROL_PLANE_WEBHOOK_SECRET=generated-webhook-secret
 The application registers sessions and sends events. The control plane returns
 signed typing and message actions to its callback URL. Full request models,
 authentication rules, and callback signing are documented in
-[`services/control-plane/README.md`](services/control-plane/README.md).
+the [application integration guide](docs/application-integration.md). The
+[control-plane service reference](services/control-plane/README.md) covers its
+internal responsibilities and operations.
 
 ## Source layout
 
@@ -113,5 +115,15 @@ benchmarks/                Capacity benchmark
 services/control-plane/    Generic AI participant service
 tests/                     Model API and benchmark tests
 ```
+
+## Future work
+
+- Add an NGINX load balancer for health-aware routing across multiple model and
+  control-plane replicas.
+- Add a structured message broker for durable queues, backpressure, retries,
+  and independent event, inference, and callback workers.
+- Add an MCP server so integrated applications can expose approved tools and
+  move beyond chat-only interactions.
+- Add a request for a number of LLMs to move away from the hardcoded 4
 
 Licensed under the [MIT License](LICENSE).
