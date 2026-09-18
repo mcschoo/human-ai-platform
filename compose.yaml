@@ -95,6 +95,45 @@ services:
         max-size: 10m
         max-file: "3"
 
+  control-plane:
+    build:
+      context: ./services/control-plane
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8090"
+    environment:
+      CONTROL_PLANE_DB: /data/control-plane.db
+      CONTROL_PLANE_OPERATOR_PASSWORD: ${CONTROL_PLANE_OPERATOR_PASSWORD:-change-me}
+      CONTROL_PLANE_COOKIE_SECRET: ${CONTROL_PLANE_COOKIE_SECRET:-change-me-cookie}
+      CONTROL_PLANE_VLLM_URL: http://vllm:8000/v1
+      CONTROL_PLANE_MODEL: ${CONTROL_PLANE_MODEL:-qwen3.5-9b}
+      VLLM_API_KEY: ${VLLM_API_KEY:?Set VLLM_API_KEY in .env}
+    volumes:
+      - control-plane-data:/data
+    networks:
+      - public
+      - model
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 networks:
   public:
   model:
@@ -104,3 +143,4 @@ volumes:
   hf-cache:
   caddy-data:
   caddy-config:
+  control-plane-data:

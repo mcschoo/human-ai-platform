@@ -4,6 +4,10 @@ A self-hosted, OpenAI-compatible inference service for research applications. Th
 platform keeps model serving on infrastructure you control and exposes
 `/v1/chat/completions` and `/v1/responses` to clients such as GRAIL.
 
+The optional [AI participant control plane](services/control-plane/README.md)
+adds generic multi-application session orchestration, durable signed callbacks,
+and a loopback-only operator dashboard.
+
 > This repository provides model infrastructure, not a human-subjects research
 > protocol. Consent, withdrawal, debriefing, participant-facing disclosure, and
 > study-specific data-retention policy remain the responsibility of the consuming
