@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
+from tqdm import tqdm
 
 PROMPTS = {
     "short": "In one sentence, explain why deterministic tests are useful.",
@@ -159,6 +160,9 @@ def summarize(
             if batch_ms and good
             else None
         ),
+        "requests_per_second": (
+            len(good) / (batch_ms / 1000) if batch_ms and good else None
+        ),
         "ttft_ms": {
             "p50": percentile(ttfts, 0.50),
             "p95": percentile(ttfts, 0.95),
@@ -172,12 +176,158 @@ def summarize(
     }
 
 
+# Input: One benchmark summary and its latency limits.
+# Output: A pass flag and short failure reasons.
+def evaluate(
+    result: dict[str, Any],
+    max_p95_ttft_ms: float,
+    max_p95_total_ms: float,
+) -> tuple[bool, list[str]]:
+    reasons = []
+    ttft = result["ttft_ms"]["p95"]
+    total = result["total_ms"]["p95"]
+    if result["errors"]:
+        reasons.append(f"{result['errors']} request errors")
+    if result["protocol_errors"]:
+        reasons.append(f"{result['protocol_errors']} protocol errors")
+    if ttft is None or total is None:
+        reasons.append("missing latency samples")
+    if ttft is not None and ttft > max_p95_ttft_ms:
+        reasons.append(f"p95 TTFT {ttft:.0f}ms > {max_p95_ttft_ms:.0f}ms")
+    if total is not None and total > max_p95_total_ms:
+        reasons.append(f"p95 total {total:.0f}ms > {max_p95_total_ms:.0f}ms")
+    return not reasons, reasons
+
+
+# Input: One model client, prompt profile, and concurrency level.
+# Output: A measured and evaluated benchmark result.
+async def run_level(
+    client: AsyncOpenAI,
+    args: argparse.Namespace,
+    profile: str,
+    concurrency: int,
+) -> dict[str, Any]:
+    semaphore = asyncio.Semaphore(concurrency)
+    tasks = [
+        asyncio.create_task(
+            run_stream(
+                client,
+                args.model,
+                PROMPTS[profile],
+                args.max_tokens,
+                semaphore,
+            )
+        )
+        for _ in range(concurrency * args.repetitions)
+    ]
+    started = time.perf_counter()
+    samples = []
+    progress = tqdm(
+        total=len(tasks),
+        desc=f"{profile} c={concurrency}",
+        unit="request",
+        disable=args.no_progress,
+    )
+    try:
+        for task in asyncio.as_completed(tasks):
+            samples.append(await task)
+            progress.update()
+    finally:
+        progress.close()
+    result = summarize(
+        profile,
+        concurrency,
+        samples,
+        (time.perf_counter() - started) * 1000,
+    )
+    passed, reasons = evaluate(
+        result,
+        args.max_p95_ttft_ms,
+        args.max_p95_total_ms,
+    )
+    try:
+        await require_health(args.health_url, min(args.timeout, 30))
+    except Exception as exc:  # noqa: BLE001 - health failure is a benchmark result.
+        passed = False
+        reasons.append(f"model unhealthy: {exc}")
+    result["passed"] = passed
+    result["failure_reasons"] = reasons
+    if not args.include_samples:
+        result.pop("samples")
+    _print_result(result)
+    return result
+
+
+# Input: A measured result.
+# Output: One compact human-readable terminal line.
+def _print_result(result: dict[str, Any]) -> None:
+    ttft = result["ttft_ms"]
+    total = result["total_ms"]
+    state = "PASS" if result["passed"] else "FAIL"
+    print(
+        f"{state} {result['profile']:5} c={result['concurrency']} "
+        f"n={result['requests']} "
+        f"ttft p50/p95={_ms(ttft['p50'])}/{_ms(ttft['p95'])} "
+        f"total p50/p95={_ms(total['p50'])}/{_ms(total['p95'])} "
+        f"req/s={result['requests_per_second'] or 0:.2f} "
+        f"tok/s={result['output_tokens_per_second'] or 0:.1f}"
+    )
+    if result["failure_reasons"]:
+        print("  " + "; ".join(result["failure_reasons"]))
+
+
+# Input: Capacity bounds.
+# Output: Increasing coarse levels ending at the configured maximum.
+def capacity_levels(max_concurrency: int) -> list[int]:
+    levels = [value for value in (1, 5, 10, 20) if value <= max_concurrency]
+    value = 40
+    while value < max_concurrency:
+        levels.append(value)
+        value *= 2
+    if not levels or levels[-1] != max_concurrency:
+        levels.append(max_concurrency)
+    return levels
+
+
+# Input: One prompt profile and capacity limits.
+# Output: Measurements plus the last passing and first failing levels.
+async def find_capacity(
+    client: AsyncOpenAI,
+    args: argparse.Namespace,
+    profile: str,
+) -> tuple[list[dict[str, Any]], int, int | None]:
+    measured: dict[int, dict[str, Any]] = {}
+    last_pass = 0
+    first_fail = None
+    for concurrency in capacity_levels(args.max_concurrency):
+        result = await run_level(client, args, profile, concurrency)
+        measured[concurrency] = result
+        if result["passed"]:
+            last_pass = concurrency
+            continue
+        first_fail = concurrency
+        break
+    if first_fail is not None:
+        low, high = last_pass, first_fail
+        while high - low > 1:
+            middle = (low + high) // 2
+            result = await run_level(client, args, profile, middle)
+            measured[middle] = result
+            if result["passed"]:
+                low = middle
+            else:
+                high = middle
+        last_pass, first_fail = low, high
+    return [measured[key] for key in sorted(measured)], last_pass, first_fail
+
+
 async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     await require_health(args.health_url, min(args.timeout, 30))
     environment_before = environment_info()
     profiles = list(PROMPTS) if args.profile == "all" else [args.profile]
-    results: list[dict[str, Any]] = []
+    results = []
+    capacity = {}
     async with AsyncOpenAI(
         base_url=args.base_url,
         api_key=args.api_key,
@@ -185,40 +335,36 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         max_retries=0,
     ) as client:
         for profile in profiles:
-            prompt = PROMPTS[profile]
             for _ in range(args.warmup):
                 warmup = await run_stream(
                     client,
                     args.model,
-                    prompt,
+                    PROMPTS[profile],
                     min(args.max_tokens, 32),
                     asyncio.Semaphore(1),
                 )
                 if warmup.error:
                     raise RuntimeError(f"{profile} warm-up failed: {warmup.error}")
-            for concurrency in args.concurrency:
-                semaphore = asyncio.Semaphore(concurrency)
-                tasks = [
-                    run_stream(client, args.model, prompt, args.max_tokens, semaphore)
-                    for _ in range(concurrency * args.repetitions)
-                ]
-                batch_started = time.perf_counter()
-                samples = await asyncio.gather(*tasks)
-                batch_ms = (time.perf_counter() - batch_started) * 1000
-                result = summarize(profile, concurrency, samples, batch_ms)
-                results.append(result)
-                ttft = result["ttft_ms"]
-                total = result["total_ms"]
-                print(
-                    f"{profile:5} c={concurrency:2} n={len(samples):3} "
-                    f"ttft p50/p95={_ms(ttft['p50'])}/{_ms(ttft['p95'])} "
-                    f"total p50/p95={_ms(total['p50'])}/{_ms(total['p95'])} "
-                    f"tok/s={result['output_tokens_per_second'] or 0:.1f} "
-                    f"errors={result['errors']} protocol={result['protocol_errors']}"
+            if args.find_max:
+                found, last_pass, first_fail = await find_capacity(
+                    client, args, profile
                 )
+                results.extend(found)
+                capacity[profile] = {
+                    "max_sustainable_concurrency": last_pass,
+                    "first_failing_concurrency": first_fail,
+                    "required_concurrency": args.required_concurrency,
+                    "required_concurrency_passed": last_pass
+                    >= args.required_concurrency,
+                }
+            else:
+                for concurrency in args.concurrency:
+                    results.append(
+                        await run_level(client, args, profile, concurrency)
+                    )
     await require_health(args.health_url, min(args.timeout, 30))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "environment_before": environment_before,
         "environment_after": environment_info(),
@@ -228,6 +374,11 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "repetitions": args.repetitions,
         "warmup": args.warmup,
         "max_tokens": args.max_tokens,
+        "gates": {
+            "max_p95_ttft_ms": args.max_p95_ttft_ms,
+            "max_p95_total_ms": args.max_p95_total_ms,
+        },
+        "capacity": capacity,
         "results": results,
     }
 
@@ -256,8 +407,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=192)
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--find-max", action="store_true")
+    parser.add_argument("--max-concurrency", type=int, default=128)
+    parser.add_argument("--required-concurrency", type=int, default=20)
+    parser.add_argument("--max-p95-ttft-ms", type=float, default=5000)
+    parser.add_argument("--max-p95-total-ms", type=float, default=30000)
+    parser.add_argument("--include-samples", action="store_true")
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--seed", type=int, default=20260915)
-    parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("benchmarks/results/latest.json"),
+    )
     args = parser.parse_args()
     if not args.model:
         parser.error("--model or OPENAI_MODEL is required")
@@ -265,8 +427,12 @@ def parse_args() -> argparse.Namespace:
         any(value < 1 for value in args.concurrency)
         or args.repetitions < 1
         or args.warmup < 0
+        or args.max_concurrency < 1
+        or args.required_concurrency < 1
+        or args.max_p95_ttft_ms <= 0
+        or args.max_p95_total_ms <= 0
     ):
-        parser.error("concurrency/repetitions must be positive and warmup non-negative")
+        parser.error("concurrency and gate values must be positive")
     return args
 
 
@@ -276,8 +442,23 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     errors = sum(item["errors"] for item in result["results"])
-    print(f"Wrote {args.output} ({errors} errors)")
-    return 1 if errors else 0
+    if args.find_max:
+        gate_failed = any(
+            not item["required_concurrency_passed"]
+            for item in result["capacity"].values()
+        )
+    else:
+        gate_failed = any(not item["passed"] for item in result["results"])
+    print(f"Wrote {args.output} ({errors} request errors)")
+    if args.find_max:
+        for profile, item in result["capacity"].items():
+            print(
+                f"{profile}: max sustainable concurrency "
+                f"{item['max_sustainable_concurrency']}"
+            )
+    if errors and not args.find_max:
+        return 1
+    return 2 if gate_failed else 0
 
 
 if __name__ == "__main__":

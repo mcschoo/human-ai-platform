@@ -10,7 +10,7 @@ class Settings:
     operator_bind: str = "127.0.0.1"
     vllm_base_url: str = "http://vllm:8000/v1"
     vllm_api_key: str = ""
-    model: str = "qwen3.5-9b"
+    model: str = "gemma-4-12b-it"
     webhook_timeout_seconds: float = 10.0
     max_webhook_attempts: int = 5
     context_messages: int = 40

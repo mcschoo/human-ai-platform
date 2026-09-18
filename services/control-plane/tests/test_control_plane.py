@@ -11,6 +11,7 @@ from control_plane.api import create_app
 from control_plane.models import (
     ActionKind,
     CallbackAction,
+    GroupPolicy,
     RuntimeEvent,
     SessionRegistration,
 )
@@ -267,6 +268,7 @@ def test_operator_cookie_and_dashboard_navigation(tmp_path) -> None:
         assert login.status_code == 303
         page = client.get("/operator")
         assert page.status_code == 200
+        assert "Connected applications" in page.text
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
         form = {
             "appId": "dashboard-app",
@@ -289,6 +291,59 @@ def test_operator_cookie_and_dashboard_navigation(tmp_path) -> None:
         )
         assert saved.status_code == 303
         assert app.state.repo.personalities("dashboard-app")[0]["name"] == "Friendly"
+        app.state.repo.save_session(
+            "dashboard-app",
+            SessionRegistration.model_validate(session("dashboard-session", "private")),
+        )
+        app_page = client.get("/operator/apps/dashboard-app")
+        assert "Created " in app_page.text
+        assert "Unnamed group" in app_page.text
+        assert "button-danger" in app_page.text
+        assert 'aria-label="Back to Applications"' in app_page.text
+        group_page = client.get(
+            "/operator/apps/dashboard-app/groups/group-a"
+        )
+        assert (
+            'aria-label="Back to dashboard-app"'
+            in group_page.text
+        )
+        renamed = client.post(
+            "/operator/apps/dashboard-app/groups/group-a/metadata",
+            data={"displayName": "Friday pilot", "csrf": csrf},
+            follow_redirects=False,
+        )
+        assert renamed.status_code == 303
+        assert app.state.repo.get_group("dashboard-app", "group-a")[
+            "display_name"
+        ] == "Friday pilot"
+        app.state.repo.save_group_policy(
+            "dashboard-app",
+            GroupPolicy(
+                groupId="group-a",
+                personalityAssignments={"ai-1": "friendly"},
+            ),
+        )
+        deleted = client.post(
+            "/operator/apps/dashboard-app/personalities/friendly/delete",
+            data={"csrf": csrf},
+            follow_redirects=False,
+        )
+        assert deleted.status_code == 303
+        assert app.state.repo.personalities("dashboard-app") == []
+        assert (
+            app.state.repo.group_policy(
+                "dashboard-app", "group-a"
+            ).personality_assignments
+            == {}
+        )
+        removed = client.post(
+            "/operator/apps/dashboard-app/groups/group-a/remove",
+            data={"csrf": csrf},
+            follow_redirects=False,
+        )
+        assert removed.status_code == 303
+        assert app.state.repo.list_groups("dashboard-app") == []
+        assert app.state.repo.get_session("dashboard-app", "dashboard-session")
 
 
 def test_message_event_requires_text() -> None:

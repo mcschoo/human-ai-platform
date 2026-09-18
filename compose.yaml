@@ -10,6 +10,9 @@ services:
         if [ -n "$${QUANTIZATION:-}" ]; then
           set -- --quantization "$${QUANTIZATION}"
         fi
+        if [ -n "$${REASONING_PARSER:-}" ]; then
+          set -- "$$@" --reasoning-parser "$${REASONING_PARSER}"
+        fi
         exec vllm serve "$${MODEL_ID}" \
           --revision "$${MODEL_REVISION}" \
           --host 0.0.0.0 \
@@ -23,15 +26,15 @@ services:
           --default-chat-template-kwargs "$${DEFAULT_CHAT_TEMPLATE_KWARGS}" \
           --enable-prefix-caching \
           --enable-chunked-prefill \
-          --reasoning-parser qwen3 \
           --language-model-only \
           "$$@"
     env_file:
-      - path: ./config/models/${MODEL_PROFILE:-qwen3.5-9b-bf16}.env
+      - path: ./config/models/${MODEL_PROFILE:-gemma-4-12b-bf16}.env
         required: true
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
       VLLM_API_KEY: ${VLLM_API_KEY:?Set VLLM_API_KEY in .env}
+      LD_LIBRARY_PATH: /usr/local/cuda-13.0/compat:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
     volumes:
       - hf-cache:/root/.cache/huggingface
     ipc: host
@@ -39,6 +42,7 @@ services:
       - "8000"
     networks:
       - model
+      - egress
     deploy:
       resources:
         reservations:
@@ -108,7 +112,7 @@ services:
       CONTROL_PLANE_OPERATOR_PASSWORD: ${CONTROL_PLANE_OPERATOR_PASSWORD:-change-me}
       CONTROL_PLANE_COOKIE_SECRET: ${CONTROL_PLANE_COOKIE_SECRET:-change-me-cookie}
       CONTROL_PLANE_VLLM_URL: http://vllm:8000/v1
-      CONTROL_PLANE_MODEL: ${CONTROL_PLANE_MODEL:-qwen3.5-9b}
+      CONTROL_PLANE_MODEL: ${CONTROL_PLANE_MODEL:-gemma-4-12b-it}
       VLLM_API_KEY: ${VLLM_API_KEY:?Set VLLM_API_KEY in .env}
     volumes:
       - control-plane-data:/data
@@ -138,6 +142,7 @@ networks:
   public:
   model:
     internal: true
+  egress:
 
 volumes:
   hf-cache:

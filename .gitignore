@@ -13,4 +13,5 @@ __pycache__/
 # Runtime output
 logs/
 *.log
-benchmark-results*.json
+benchmark*.json
+benchmarks/results/

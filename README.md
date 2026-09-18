@@ -1,173 +1,117 @@
 # Human AI Platform
 
-A self-hosted, OpenAI-compatible inference service for research applications. The
-platform keeps model serving on infrastructure you control and exposes
-`/v1/chat/completions` and `/v1/responses` to clients such as GRAIL.
+A small Linux/NVIDIA stack for serving an open-weight model and coordinating AI
+participants. It contains three services:
 
-The optional [AI participant control plane](services/control-plane/README.md)
-adds generic multi-application session orchestration, durable signed callbacks,
-and a loopback-only operator dashboard.
+- vLLM exposes OpenAI-compatible Chat Completions and Responses APIs.
+- Caddy keeps the model API authenticated and bound to localhost.
+- The FastAPI [control plane](services/control-plane/README.md) manages
+  applications, AI personalities, session context, callbacks, and audit data.
 
-> This repository provides model infrastructure, not a human-subjects research
-> protocol. Consent, withdrawal, debriefing, participant-facing disclosure, and
-> study-specific data-retention policy remain the responsibility of the consuming
-> application and research team.
+The consuming application remains responsible for consent, debriefing, data
+retention, and all study-specific participant policy.
 
-## Prerequisites
+## Requirements
 
-- A Linux host with a supported NVIDIA GPU and current NVIDIA driver
-- Docker Engine with Docker Compose 2.24.4 or newer (`docker compose`)
-- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
-  configured for Docker
-- Enough disk for the selected model and its cache
-- One access choice:
-  - **Local/private network:** bind the API only to a trusted interface and use
-    an SSH tunnel or private network; or
-  - **Shared/remote access:** create a DNS record, allow inbound TCP 80/443, and
-    let the included Caddy service obtain and renew the TLS certificate.
+The tested host is Linux with an NVIDIA L40S, driver 565.57.01, 48 GB VRAM,
+Python 3.10, Docker Compose 2.24.4 or newer, and NVIDIA Container Toolkit. The
+pinned vLLM 0.28.0 image uses CUDA 13.0.3 compatibility libraries.
 
-Confirm GPU container access before setup:
+Use the built-in check for another controlled Linux/NVIDIA server:
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
+./client.sh doctor
 ```
 
-## Install to first request
+It prints exact fixes for missing prerequisites. It does not install or replace
+system drivers.
+
+## Deploy
 
 ```bash
-git clone <repository-url> human-ai-platform
-cd human-ai-platform
-sh scripts/setup.sh
+./client.sh deploy
 ```
 
-The setup command creates `.env` with a random API key, validates the
-configuration, and starts the default model. PowerShell users can run
-`.\scripts\setup.ps1`. Treat `.env` as a secret and do not commit it.
+The first run creates `.env` with random secrets, starts the stack, and waits
+with a progress display until the model is ready. Docker displays container
+image downloads, while the CLI tracks model download and loading stages. Later
+operations use the same entry point:
 
-The defaults listen only on `127.0.0.1:8080`. For automatic HTTPS, stop the
-stack and set these values in `.env`:
+```bash
+./client.sh status
+./client.sh logs
+./client.sh test
+./client.sh down
+```
+
+The local model API is `http://127.0.0.1:8080/v1`. The private operator UI is
+`http://127.0.0.1:8090/operator/login`. Use SSH port forwarding to access these
+ports from another computer.
+
+## Models
+
+Gemma 4 12B is the default text-only model:
+
+```bash
+./client.sh deploy --profile gemma-4-12b-bf16
+```
+
+The repository retains two optional Qwen profiles:
+
+```bash
+./client.sh deploy --profile qwen3.5-9b-bf16
+./client.sh deploy --profile qwen3.5-27b-gptq-int4
+```
+
+Profiles in `config/models/` pin the Hugging Face revision, served name,
+precision, context limit, GPU allocation, and reasoning parser. Changing a
+profile recreates the model service and briefly interrupts requests.
+
+## Test capacity
+
+Run fixed concurrency levels:
+
+```bash
+./client.sh benchmark --concurrency 1 10 20 40
+```
+
+Find the highest level that has zero errors, p95 time-to-first-token at or below
+5 seconds, and p95 total latency at or below 30 seconds:
+
+```bash
+./client.sh benchmark --find-max --max-concurrency 128
+```
+
+Both latency limits, request counts, token limits, and the search ceiling are
+command-line options. Results are written under `benchmarks/results/`, which is
+not committed.
+
+## Connect an application
+
+Register the application in the operator UI and give its backend:
 
 ```dotenv
-PUBLIC_BIND_ADDRESS=0.0.0.0
-TLS_DOMAIN=llm.example.edu
+CONTROL_PLANE_URL=http://127.0.0.1:8090
+CONTROL_PLANE_APP_ID=your-app-id
+CONTROL_PLANE_APP_TOKEN=generated-app-token
+CONTROL_PLANE_WEBHOOK_SECRET=generated-webhook-secret
 ```
 
-Then use the TLS override whenever operating the stack:
+The application registers sessions and sends events. The control plane returns
+signed typing and message actions to its callback URL. Full request models,
+authentication rules, and callback signing are documented in
+[`services/control-plane/README.md`](services/control-plane/README.md).
 
-```bash
-docker compose -f compose.yaml -f compose.tls.yaml up -d
+## Source layout
+
+```text
+client.sh                  Developer entry point
+compose.yaml               Complete runtime stack
+config/platform.env        Tested host and benchmark requirements
+config/models/             Pinned model profiles
+benchmarks/                Capacity benchmark
+services/control-plane/    Generic AI participant service
+tests/                     Model API and benchmark tests
 ```
 
-Wait for services to become healthy:
-
-```bash
-docker compose ps
-```
-
-Set the URL and key to the values selected in `.env`. For a host-local
-deployment, the base URL is `http://localhost:8080/v1`; a TLS
-deployment should use `https://YOUR_DNS_NAME/v1`.
-
-```bash
-export OPENAI_BASE_URL=http://localhost:8080/v1
-export OPENAI_API_KEY='replace-with-your-key'
-```
-
-Make a chat-completions request:
-
-```bash
-curl --fail-with-body "$OPENAI_BASE_URL/chat/completions" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.5-9b",
-    "messages": [{"role": "user", "content": "Reply with exactly: ready"}],
-    "max_tokens": 16
-  }'
-```
-
-Or use the Responses API:
-
-```bash
-curl --fail-with-body "$OPENAI_BASE_URL/responses" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.5-9b",
-    "input": "Reply with exactly: ready",
-    "max_output_tokens": 16
-  }'
-```
-
-The advertised name comes from the active profile. The included profiles serve
-`qwen3.5-9b` and `qwen3.5-27b-gptq-int4`.
-Clients should always set `max_tokens` or `max_output_tokens`; the platform
-does not impose a custom output limit beyond the model's 8K total context cap.
-The profiles default to Qwen's non-thinking mode so structured output remains
-reliable within ordinary token limits.
-
-The 27B checkpoint occupies about 30.2 GB on disk and is experimental on a
-32 GB GPU. Use it only after its 20/30-stream benchmark passes with adequate
-GPU-memory headroom; the 9B BF16 profile is the safer default candidate.
-
-## Python client
-
-```bash
-cd examples/openai-client
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python client.py
-```
-
-The example uses the official OpenAI SDK and works against both local HTTP and
-DNS/TLS deployments.
-
-## Switch model profile
-
-Set `MODEL_PROFILE` in `.env` to `qwen3.5-9b-bf16` or
-`qwen3.5-27b-gptq-int4`, then recreate the stack:
-
-```bash
-docker compose up -d --force-recreate
-docker compose ps
-```
-
-For TLS deployments, include both Compose files as shown in the HTTPS setup
-section when running these commands.
-
-The change may download model weights and briefly interrupt requests. Validate
-the active model with a small request before resuming a study. See
-[Model switching](docs/operations.md#model-switching) for a safer operational
-sequence.
-
-## Validate a deployment
-
-Install the small validation environment and run the smoke checks:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e ".[test]"
-export OPENAI_BASE_URL=http://localhost:8080/v1
-export OPENAI_API_KEY='replace-with-your-key'
-export OPENAI_MODEL=qwen3.5-9b
-sh scripts/smoke-test.sh
-python benchmarks/stream_benchmark.py --model "$OPENAI_MODEL"
-```
-
-The benchmark tests 1, 10, 20, and 30 concurrent streams and writes
-`benchmark-results.json`. Run it on the intended 32 GB server before declaring
-a model profile supported.
-
-## Next steps
-
-- [Operations runbook](docs/operations.md)
-- [Minimal OpenAI Python client](examples/openai-client/)
-- [Connect GRAIL](examples/grail/)
-- [Security boundary](docs/operations.md#security-boundary)
-
-## License
-
-[MIT](LICENSE)
+Licensed under the [MIT License](LICENSE).

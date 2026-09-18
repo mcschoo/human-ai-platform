@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TEXT NOT NULL, PRIMARY KEY (app_id, session_id),
   FOREIGN KEY (app_id) REFERENCES apps(app_id)
 );
+CREATE TABLE IF NOT EXISTS groups (
+  app_id TEXT NOT NULL, group_id TEXT NOT NULL, display_name TEXT,
+  created_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, group_id),
+  FOREIGN KEY (app_id) REFERENCES apps(app_id)
+);
 CREATE TABLE IF NOT EXISTS events (
   app_id TEXT NOT NULL, event_id TEXT NOT NULL, session_id TEXT NOT NULL,
   payload TEXT NOT NULL, received_at TEXT NOT NULL,
@@ -68,6 +74,9 @@ CREATE INDEX IF NOT EXISTS message_session_idx
   ON messages(app_id, session_id, id);
 CREATE INDEX IF NOT EXISTS pending_due_idx
   ON pending_deliveries(status, due_at);
+INSERT OR IGNORE INTO groups (app_id, group_id, created_at)
+  SELECT app_id, group_id, MIN(created_at) FROM sessions
+  WHERE group_id IS NOT NULL GROUP BY app_id, group_id;
 """
 
 
@@ -159,6 +168,12 @@ class Repository:
 
     def save_session(self, app_id: str, session: SessionRegistration) -> None:
         with self.connect() as db:
+            if session.group_id:
+                db.execute(
+                    """INSERT OR IGNORE INTO groups
+                    (app_id, group_id, created_at) VALUES (?, ?, ?)""",
+                    (app_id, session.group_id, _now()),
+                )
             db.execute(
                 """INSERT INTO sessions
                 (app_id, session_id, group_id, registration, created_at)
@@ -188,14 +203,49 @@ class Repository:
             ).fetchone()
         return SessionRegistration.model_validate_json(row[0]) if row else None
 
-    def list_groups(self, app_id: str) -> list[str]:
+    def list_groups(self, app_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                """SELECT DISTINCT COALESCE(group_id, '(ungrouped)') AS group_id
-                FROM sessions WHERE app_id=? ORDER BY group_id""",
+                """SELECT group_id, display_name, created_at FROM groups
+                WHERE app_id=? AND archived=0 ORDER BY created_at DESC""",
                 (app_id,),
             ).fetchall()
-        return [row["group_id"] for row in rows]
+        return [dict(row) for row in rows]
+
+    def get_group(self, app_id: str, group_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT group_id, display_name, created_at, archived FROM groups
+                WHERE app_id=? AND group_id=?""",
+                (app_id, group_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    # Input: An app, group ID, and optional operator-facing name.
+    # Output: Updated group metadata and one audit event.
+    def rename_group(self, app_id: str, group_id: str, display_name: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                """UPDATE groups SET display_name=?
+                WHERE app_id=? AND group_id=?""",
+                (display_name.strip() or None, app_id, group_id),
+            )
+        self.audit(
+            app_id,
+            None,
+            "group.renamed",
+            {"groupId": group_id, "displayName": display_name.strip()},
+        )
+
+    # Input: An app and group ID to hide from normal navigation.
+    # Output: An archived group with its study records kept.
+    def archive_group(self, app_id: str, group_id: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE groups SET archived=1 WHERE app_id=? AND group_id=?",
+                (app_id, group_id),
+            )
+        self.audit(app_id, None, "group.removed", {"groupId": group_id})
 
     def list_sessions(
         self, app_id: str, group_id: str | None = None
@@ -301,6 +351,44 @@ class Repository:
                 (app_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # Input: An app and personality template ID.
+    # Output: The template is removed; session data remains unchanged.
+    def delete_personality(self, app_id: str, personality_id: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM personalities WHERE app_id=? AND personality_id=?",
+                (app_id, personality_id),
+            )
+            rows = db.execute(
+                "SELECT group_id, policy FROM group_policies WHERE app_id=?",
+                (app_id,),
+            ).fetchall()
+            for row in rows:
+                policy = GroupPolicy.model_validate_json(row["policy"])
+                assignments = {
+                    participant_id: assigned_id
+                    for participant_id, assigned_id in policy.personality_assignments.items()
+                    if assigned_id != personality_id
+                }
+                if assignments == policy.personality_assignments:
+                    continue
+                policy.personality_assignments = assignments
+                db.execute(
+                    """UPDATE group_policies SET policy=?
+                    WHERE app_id=? AND group_id=?""",
+                    (
+                        policy.model_dump_json(by_alias=True),
+                        app_id,
+                        row["group_id"],
+                    ),
+                )
+        self.audit(
+            app_id,
+            None,
+            "personality.deleted",
+            {"personalityId": personality_id},
+        )
 
     def save_group_policy(self, app_id: str, policy: GroupPolicy) -> None:
         with self.connect() as db:

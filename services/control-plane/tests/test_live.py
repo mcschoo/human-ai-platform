@@ -13,7 +13,7 @@ def test_live_responses_api_store_false() -> None:
     client = ResponsesClient(
         os.getenv("CONTROL_PLANE_VLLM_URL", "http://127.0.0.1:8000/v1"),
         os.environ["VLLM_API_KEY"],
-        os.getenv("CONTROL_PLANE_MODEL", "qwen3.5-9b"),
+        os.getenv("CONTROL_PLANE_MODEL", "gemma-4-12b-it"),
     )
     text = asyncio.run(
         client.respond(
